@@ -70,7 +70,10 @@ use regex::Regex;
 
 use lazy_static::lazy_static;
 
+use crate::project::{ProjectReportTable, Projects};
+use std::borrow::Borrow;
 use std::time::Instant;
+use task_hookrs::project::Project;
 
 const MAX_LINE: usize = 4096;
 
@@ -151,6 +154,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 #[derive(PartialEq)]
 pub enum AppMode {
+    Tasks(TaskMode),
+    Calendar,
+    Projects(ProjectMode),
+}
+#[derive(PartialEq)]
+pub enum TaskMode {
     TaskReport,
     TaskFilter,
     TaskAdd,
@@ -163,7 +172,19 @@ pub enum AppMode {
     TaskContextMenu,
     TaskJump,
     TaskDeletePrompt,
-    Calendar,
+}
+#[derive(PartialEq)]
+pub enum ProjectMode {
+    ProjectReport,
+    ProjectAdd,
+    ProjectAnnotate,
+    ProjectLog,
+    ProjectModify,
+    ProjectHelpPopup,
+    ProjectError,
+    ProjectContextMenu,
+    ProjectJump,
+    ProjectDeletePrompt,
 }
 
 pub struct TaskwarriorTuiApp {
@@ -203,6 +224,7 @@ pub struct TaskwarriorTuiApp {
     pub completion_list: CompletionList,
     pub show_completion_pane: bool,
     pub report: String,
+    pub projects: Projects,
 }
 
 impl TaskwarriorTuiApp {
@@ -251,7 +273,7 @@ impl TaskwarriorTuiApp {
             filter: LineBuffer::with_capacity(MAX_LINE),
             modify: LineBuffer::with_capacity(MAX_LINE),
             error: "".to_string(),
-            mode: AppMode::TaskReport,
+            mode: AppMode::Tasks(TaskMode::TaskReport),
             task_report_height: 0,
             task_details_scroll: 0,
             task_report_show_info: c.uda_task_report_show_info,
@@ -269,6 +291,7 @@ impl TaskwarriorTuiApp {
             completion_list: CompletionList::with_items(vec![]),
             show_completion_pane: false,
             report: report.to_string(),
+            projects: Projects::new()?,
         };
 
         for c in app.config.filter.chars() {
@@ -310,19 +333,9 @@ impl TaskwarriorTuiApp {
         self.terminal_width = rect.width;
         self.terminal_height = rect.height;
         match self.mode {
-            AppMode::TaskReport
-            | AppMode::TaskJump
-            | AppMode::TaskFilter
-            | AppMode::TaskAdd
-            | AppMode::TaskAnnotate
-            | AppMode::TaskContextMenu
-            | AppMode::TaskDeletePrompt
-            | AppMode::TaskError
-            | AppMode::TaskHelpPopup
-            | AppMode::TaskSubprocess
-            | AppMode::TaskLog
-            | AppMode::TaskModify => self.draw_task(f),
+            AppMode::Tasks(_) => self.draw_task(f),
             AppMode::Calendar => self.draw_calendar(f),
+            AppMode::Projects(_) => self.draw_projects(f),
         }
     }
 
@@ -335,6 +348,65 @@ impl TaskwarriorTuiApp {
         f.render_widget(p, area);
     }
 
+    pub fn draw_projects(&mut self, f: &mut Frame<impl Backend>) {
+        let dates_with_styles = self.get_dates_with_styles();
+        let rects = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0)].as_ref())
+            .split(f.size());
+        let today = Local::today();
+        let mut title = vec![
+            Span::styled("Task", Style::default().add_modifier(Modifier::DIM)),
+            Span::from("|"),
+            Span::styled("Projects", Style::default().add_modifier(Modifier::BOLD)),
+            Span::from("|"),
+            Span::styled("Calendar", Style::default().add_modifier(Modifier::DIM)),
+        ];
+
+        if self.projects.report_table.rows.is_empty() {
+            if !self.current_context.is_empty() {
+                let context_style = Style::default();
+                context_style.add_modifier(Modifier::ITALIC);
+                title.insert(title.len(), Span::from(" ("));
+                title.insert(title.len(), Span::styled(&self.current_context, context_style));
+                title.insert(title.len(), Span::from(")"));
+            }
+
+            f.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(Spans::from(title)),
+                rect,
+            );
+            return;
+        }
+
+        let selected = self.projects.current_selection;
+        let task_ids = if self.projects.list.is_empty() {
+            vec!["0".to_string()]
+        } else {
+            match self.projects.table_state.mode() {
+                TableMode::SingleSelection => vec![self.projects.list[selected].clone()],
+
+                _ => {
+                    vec![]
+                }
+            }
+        };
+        match self.mode {
+            AppMode::Projects(ProjectMode::ProjectReport) => self.draw_command(
+                f,
+                rects[0],
+                self.filter.as_str(),
+                title,
+                self.get_position(&self.filter),
+                false,
+            ),
+            _ => {}
+        }
+    }
+
     pub fn draw_calendar(&mut self, f: &mut Frame<impl Backend>) {
         let dates_with_styles = self.get_dates_with_styles();
         let rects = Layout::default()
@@ -344,6 +416,8 @@ impl TaskwarriorTuiApp {
         let today = Local::today();
         let mut title = vec![
             Span::styled("Task", Style::default().add_modifier(Modifier::DIM)),
+            Span::from("|"),
+            Span::styled("Projects", Style::default().add_modifier(Modifier::DIM)),
             Span::from("|"),
             Span::styled("Calendar", Style::default().add_modifier(Modifier::BOLD)),
         ];
@@ -369,30 +443,6 @@ impl TaskwarriorTuiApp {
             .months_per_row(self.config.uda_calendar_months_per_row);
         c.title_background_color = self.config.uda_style_calendar_title.bg.unwrap_or(Color::Reset);
         f.render_widget(c, rects[0]);
-    }
-
-    pub fn get_dates_with_styles(&self) -> Vec<(NaiveDate, Style)> {
-        let mut tasks_with_styles = vec![];
-
-        if !self.tasks.is_empty() {
-            let tasks = &self.tasks;
-            let tasks_with_due_dates = tasks.iter().filter(|t| t.due().is_some());
-
-            tasks_with_styles
-                .extend(tasks_with_due_dates.map(|t| (t.due().unwrap().clone().date(), self.style_for_task(t))))
-        }
-        tasks_with_styles
-    }
-
-    pub fn get_position(&self, lb: &LineBuffer) -> usize {
-        let mut position = 0;
-        for (i, (_i, g)) in lb.as_str().grapheme_indices(true).enumerate() {
-            if _i == lb.pos() {
-                break;
-            }
-            position += g.width();
-        }
-        position
     }
 
     pub fn draw_task(&mut self, f: &mut Frame<impl Backend>) {
@@ -437,7 +487,7 @@ impl TaskwarriorTuiApp {
             }
         };
         match self.mode {
-            AppMode::TaskReport => self.draw_command(
+            AppMode::Tasks(TaskMode::TaskReport) => self.draw_command(
                 f,
                 rects[1],
                 self.filter.as_str(),
@@ -445,7 +495,7 @@ impl TaskwarriorTuiApp {
                 self.get_position(&self.filter),
                 false,
             ),
-            AppMode::TaskJump => {
+            AppMode::Tasks(TaskMode::TaskJump) => {
                 let position = self.get_position(&self.command);
                 self.draw_command(
                     f,
@@ -456,7 +506,7 @@ impl TaskwarriorTuiApp {
                     true,
                 );
             }
-            AppMode::TaskFilter => {
+            AppMode::Tasks(TaskMode::TaskFilter) => {
                 let position = self.get_position(&self.filter);
                 if self.show_completion_pane {
                     self.draw_completion_pop_up(f, rects[1], position);
@@ -470,7 +520,7 @@ impl TaskwarriorTuiApp {
                     true,
                 );
             }
-            AppMode::TaskLog => {
+            AppMode::Tasks(TaskMode::TaskLog) => {
                 let position = self.get_position(&self.command);
                 if self.show_completion_pane {
                     self.draw_completion_pop_up(f, rects[1], position);
@@ -484,7 +534,7 @@ impl TaskwarriorTuiApp {
                     true,
                 );
             }
-            AppMode::TaskSubprocess => {
+            AppMode::Tasks(TaskMode::TaskSubprocess) => {
                 let position = self.get_position(&self.command);
                 self.draw_command(
                     f,
@@ -495,7 +545,7 @@ impl TaskwarriorTuiApp {
                     true,
                 );
             }
-            AppMode::TaskModify => {
+            AppMode::Tasks(TaskMode::TaskModify) => {
                 let position = self.get_position(&self.modify);
                 if self.show_completion_pane {
                     self.draw_completion_pop_up(f, rects[1], position);
@@ -514,7 +564,7 @@ impl TaskwarriorTuiApp {
                     true,
                 );
             }
-            AppMode::TaskAnnotate => {
+            AppMode::Tasks(TaskMode::TaskAnnotate) => {
                 let position = self.get_position(&self.command);
                 if self.show_completion_pane {
                     self.draw_completion_pop_up(f, rects[1], position);
@@ -533,7 +583,7 @@ impl TaskwarriorTuiApp {
                     true,
                 );
             }
-            AppMode::TaskAdd => {
+            AppMode::Tasks(TaskMode::TaskAdd) => {
                 let position = self.get_position(&self.command);
                 if self.show_completion_pane {
                     self.draw_completion_pop_up(f, rects[1], position);
@@ -547,7 +597,7 @@ impl TaskwarriorTuiApp {
                     true,
                 );
             }
-            AppMode::TaskError => {
+            AppMode::Tasks(TaskMode::TaskError) => {
                 self.draw_command(
                     f,
                     rects[1],
@@ -557,7 +607,7 @@ impl TaskwarriorTuiApp {
                     false,
                 );
             }
-            AppMode::TaskHelpPopup => {
+            AppMode::Tasks(TaskMode::TaskHelpPopup) => {
                 self.draw_command(
                     f,
                     rects[1],
@@ -568,7 +618,7 @@ impl TaskwarriorTuiApp {
                 );
                 self.draw_help_popup(f, 80, 90);
             }
-            AppMode::TaskContextMenu => {
+            AppMode::Tasks(TaskMode::TaskContextMenu) => {
                 self.draw_command(
                     f,
                     rects[1],
@@ -579,7 +629,7 @@ impl TaskwarriorTuiApp {
                 );
                 self.draw_context_menu(f, 80, 50);
             }
-            AppMode::TaskDeletePrompt => {
+            AppMode::Tasks(TaskMode::TaskDeletePrompt) => {
                 let label = if task_ids.len() > 1 {
                     format!("Delete Tasks {}?", task_ids.join(","))
                 } else {
@@ -606,6 +656,30 @@ impl TaskwarriorTuiApp {
                 panic!("Reached unreachable code. Something went wrong");
             }
         }
+    }
+
+    pub fn get_dates_with_styles(&self) -> Vec<(NaiveDate, Style)> {
+        let mut tasks_with_styles = vec![];
+
+        if !self.tasks.is_empty() {
+            let tasks = &self.tasks;
+            let tasks_with_due_dates = tasks.iter().filter(|t| t.due().is_some());
+
+            tasks_with_styles
+                .extend(tasks_with_due_dates.map(|t| (t.due().unwrap().clone().date(), self.style_for_task(t))))
+        }
+        tasks_with_styles
+    }
+
+    pub fn get_position(&self, lb: &LineBuffer) -> usize {
+        let mut position = 0;
+        for (i, (_i, g)) in lb.as_str().grapheme_indices(true).enumerate() {
+            if _i == lb.pos() {
+                break;
+            }
+            position += g.width();
+        }
+        position
     }
 
     fn draw_help_popup(&mut self, f: &mut Frame<impl Backend>, percent_x: u16, percent_y: u16) {
@@ -930,19 +1004,21 @@ impl TaskwarriorTuiApp {
 
     fn draw_task_report(&mut self, f: &mut Frame<impl Backend>, rect: Rect) {
         let (tasks, headers) = self.get_task_report();
+        let mut style = Style::default();
+        match self.mode {
+            AppMode::Tasks(TaskMode::TaskReport) => style = style.add_modifier(Modifier::BOLD),
+            _ => style = style.add_modifier(Modifier::DIM),
+        }
+
+        let mut title = vec![
+            Span::styled("Task", style),
+            Span::from("|"),
+            Span::styled("Projects", Style::default().add_modifier(Modifier::DIM)),
+            Span::from("|"),
+            Span::styled("Calendar", Style::default().add_modifier(Modifier::DIM)),
+        ];
+
         if tasks.is_empty() {
-            let mut style = Style::default();
-            match self.mode {
-                AppMode::TaskReport => style = style.add_modifier(Modifier::BOLD),
-                _ => style = style.add_modifier(Modifier::DIM),
-            }
-
-            let mut title = vec![
-                Span::styled("Task", style),
-                Span::from("|"),
-                Span::styled("Calendar", Style::default().add_modifier(Modifier::DIM)),
-            ];
-
             if !self.current_context.is_empty() {
                 let context_style = Style::default();
                 context_style.add_modifier(Modifier::ITALIC);
@@ -998,18 +1074,6 @@ impl TaskwarriorTuiApp {
             .iter()
             .map(|i| Constraint::Length((*i).try_into().unwrap_or(maximum_column_width as u16)))
             .collect();
-
-        let mut style = Style::default();
-        match self.mode {
-            AppMode::TaskReport => style = style.add_modifier(Modifier::BOLD),
-            _ => style = style.add_modifier(Modifier::DIM),
-        }
-
-        let mut title = vec![
-            Span::styled("Task", style),
-            Span::from("|"),
-            Span::styled("Calendar", Style::default().add_modifier(Modifier::DIM)),
-        ];
 
         if !self.current_context.is_empty() {
             let context_style = Style::default();
@@ -2115,10 +2179,19 @@ impl TaskwarriorTuiApp {
         es.push('"');
         es
     }
-
+    //TODO REFACTOR THIS SHIT
     pub fn handle_input(&mut self, input: Key) -> Result<()> {
         match self.mode {
-            AppMode::TaskReport => {
+            AppMode::Projects(_) => {
+                if input == self.keyconfig.quit || input == Key::Ctrl('c') {
+                    self.should_quit = true;
+                } else if input == self.keyconfig.next_tab {
+                    self.mode = AppMode::Calendar;
+                } else if input == self.keyconfig.previous_tab {
+                    self.mode = AppMode::Tasks(TaskMode::TaskReport);
+                }
+            }
+            AppMode::Tasks(TaskMode::TaskReport) => {
                 if input == Key::Esc {
                     self.marked.clear();
                 } else if input == self.keyconfig.quit || input == Key::Ctrl('c') {
@@ -2151,21 +2224,21 @@ impl TaskwarriorTuiApp {
                     match self.task_done() {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
                 } else if input == self.keyconfig.delete {
                     if self.config.uda_task_report_prompt_on_delete {
-                        self.mode = AppMode::TaskDeletePrompt;
+                        self.mode = AppMode::Tasks(TaskMode::TaskDeletePrompt);
                         if self.task_current().is_none() {
-                            self.mode = AppMode::TaskReport;
+                            self.mode = AppMode::Tasks(TaskMode::TaskReport);
                         }
                     } else {
                         match self.task_delete() {
                             Ok(_) => self.update(true)?,
                             Err(e) => {
-                                self.mode = AppMode::TaskError;
+                                self.mode = AppMode::Tasks(TaskMode::TaskError);
                                 self.error = e;
                             }
                         }
@@ -2174,7 +2247,7 @@ impl TaskwarriorTuiApp {
                     match self.task_start_stop() {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2182,7 +2255,7 @@ impl TaskwarriorTuiApp {
                     match self.task_undo() {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2191,12 +2264,12 @@ impl TaskwarriorTuiApp {
                     match r {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
                 } else if input == self.keyconfig.modify {
-                    self.mode = AppMode::TaskModify;
+                    self.mode = AppMode::Tasks(TaskMode::TaskModify);
                     self.update_completion_list();
                     match self.task_table_state.mode() {
                         TableMode::SingleSelection => match self.task_current() {
@@ -2240,29 +2313,29 @@ impl TaskwarriorTuiApp {
                         TableMode::MultipleSelection => self.modify.update("", 0),
                     }
                 } else if input == self.keyconfig.shell {
-                    self.mode = AppMode::TaskSubprocess;
+                    self.mode = AppMode::Tasks(TaskMode::TaskSubprocess);
                 } else if input == self.keyconfig.log {
-                    self.mode = AppMode::TaskLog;
+                    self.mode = AppMode::Tasks(TaskMode::TaskLog);
                     self.update_completion_list();
                 } else if input == self.keyconfig.add {
-                    self.mode = AppMode::TaskAdd;
+                    self.mode = AppMode::Tasks(TaskMode::TaskAdd);
                     self.update_completion_list();
                 } else if input == self.keyconfig.annotate {
-                    self.mode = AppMode::TaskAnnotate;
+                    self.mode = AppMode::Tasks(TaskMode::TaskAnnotate);
                     self.update_completion_list();
                 } else if input == self.keyconfig.help {
-                    self.mode = AppMode::TaskHelpPopup;
+                    self.mode = AppMode::Tasks(TaskMode::TaskHelpPopup);
                 } else if input == self.keyconfig.filter {
-                    self.mode = AppMode::TaskFilter;
+                    self.mode = AppMode::Tasks(TaskMode::TaskFilter);
                     self.update_completion_list();
                 } else if input == Key::Char(':') {
-                    self.mode = AppMode::TaskJump;
+                    self.mode = AppMode::Tasks(TaskMode::TaskJump);
                 } else if input == self.keyconfig.shortcut1 {
                     match self.task_shortcut(1) {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
                             self.update(true)?;
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2271,7 +2344,7 @@ impl TaskwarriorTuiApp {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
                             self.update(true)?;
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2280,7 +2353,7 @@ impl TaskwarriorTuiApp {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
                             self.update(true)?;
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2289,7 +2362,7 @@ impl TaskwarriorTuiApp {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
                             self.update(true)?;
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2298,7 +2371,7 @@ impl TaskwarriorTuiApp {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
                             self.update(true)?;
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2307,7 +2380,7 @@ impl TaskwarriorTuiApp {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
                             self.update(true)?;
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2316,7 +2389,7 @@ impl TaskwarriorTuiApp {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
                             self.update(true)?;
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2325,7 +2398,7 @@ impl TaskwarriorTuiApp {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
                             self.update(true)?;
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
@@ -2334,21 +2407,21 @@ impl TaskwarriorTuiApp {
                         Ok(_) => self.update(true)?,
                         Err(e) => {
                             self.update(true)?;
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
                 } else if input == self.keyconfig.zoom {
                     self.task_report_show_info = !self.task_report_show_info;
                 } else if input == self.keyconfig.context_menu {
-                    self.mode = AppMode::TaskContextMenu;
+                    self.mode = AppMode::Tasks(TaskMode::TaskContextMenu);
                 } else if input == self.keyconfig.next_tab {
-                    self.mode = AppMode::Calendar;
+                    self.mode = AppMode::Projects(ProjectMode::ProjectReport);
                 }
             }
-            AppMode::TaskContextMenu => {
+            AppMode::Tasks(TaskMode::TaskContextMenu) => {
                 if input == self.keyconfig.quit || input == Key::Esc {
-                    self.mode = AppMode::TaskReport;
+                    self.mode = AppMode::Tasks(TaskMode::TaskReport);
                 } else if input == Key::Down || input == self.keyconfig.down {
                     self.context_next();
                 } else if input == Key::Up || input == self.keyconfig.up {
@@ -2360,15 +2433,15 @@ impl TaskwarriorTuiApp {
                             self.update(true)?;
                         }
                         Err(e) => {
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
                 }
             }
-            AppMode::TaskHelpPopup => {
+            AppMode::Tasks(TaskMode::TaskHelpPopup) => {
                 if input == self.keyconfig.quit || input == Key::Esc {
-                    self.mode = AppMode::TaskReport;
+                    self.mode = AppMode::Tasks(TaskMode::TaskReport);
                 } else if input == self.keyconfig.down {
                     self.help_popup.scroll = self.help_popup.scroll.checked_add(1).unwrap_or(0);
                     let th = (self.help_popup.text_height as u16).saturating_sub(1);
@@ -2379,14 +2452,14 @@ impl TaskwarriorTuiApp {
                     self.help_popup.scroll = self.help_popup.scroll.saturating_sub(1);
                 }
             }
-            AppMode::TaskModify => match input {
+            AppMode::Tasks(TaskMode::TaskModify) => match input {
                 Key::Esc => {
                     if self.show_completion_pane {
                         self.show_completion_pane = false;
                         self.completion_list.unselect();
                     } else {
                         self.modify.update("", 0);
-                        self.mode = AppMode::TaskReport;
+                        self.mode = AppMode::Tasks(TaskMode::TaskReport);
                     }
                 }
                 Key::Char('\n') => {
@@ -2400,13 +2473,13 @@ impl TaskwarriorTuiApp {
                     } else {
                         match self.task_modify() {
                             Ok(_) => {
-                                self.mode = AppMode::TaskReport;
+                                self.mode = AppMode::Tasks(TaskMode::TaskReport);
                                 self.command_history_context.add(self.modify.as_str());
                                 self.modify.update("", 0);
                                 self.update(true)?;
                             }
                             Err(e) => {
-                                self.mode = AppMode::TaskError;
+                                self.mode = AppMode::Tasks(TaskMode::TaskError);
                                 self.error = e;
                             }
                         }
@@ -2456,32 +2529,32 @@ impl TaskwarriorTuiApp {
                     self.update_input_for_completion();
                 }
             },
-            AppMode::TaskSubprocess => match input {
+            AppMode::Tasks(TaskMode::TaskSubprocess) => match input {
                 Key::Char('\n') => match self.task_subprocess() {
                     Ok(_) => {
-                        self.mode = AppMode::TaskReport;
+                        self.mode = AppMode::Tasks(TaskMode::TaskReport);
                         self.command.update("", 0);
                         self.update(true)?;
                     }
                     Err(e) => {
-                        self.mode = AppMode::TaskError;
+                        self.mode = AppMode::Tasks(TaskMode::TaskError);
                         self.error = e;
                     }
                 },
                 Key::Esc => {
                     self.command.update("", 0);
-                    self.mode = AppMode::TaskReport;
+                    self.mode = AppMode::Tasks(TaskMode::TaskReport);
                 }
                 _ => handle_movement(&mut self.command, input),
             },
-            AppMode::TaskLog => match input {
+            AppMode::Tasks(TaskMode::TaskLog) => match input {
                 Key::Esc => {
                     if self.show_completion_pane {
                         self.show_completion_pane = false;
                         self.completion_list.unselect();
                     } else {
                         self.command.update("", 0);
-                        self.mode = AppMode::TaskReport;
+                        self.mode = AppMode::Tasks(TaskMode::TaskReport);
                     }
                 }
                 Key::Char('\n') => {
@@ -2495,13 +2568,13 @@ impl TaskwarriorTuiApp {
                     } else {
                         match self.task_log() {
                             Ok(_) => {
-                                self.mode = AppMode::TaskReport;
+                                self.mode = AppMode::Tasks(TaskMode::TaskReport);
                                 self.command_history_context.add(self.command.as_str());
                                 self.command.update("", 0);
                                 self.update(true)?;
                             }
                             Err(e) => {
-                                self.mode = AppMode::TaskError;
+                                self.mode = AppMode::Tasks(TaskMode::TaskError);
                                 self.error = e;
                             }
                         }
@@ -2551,14 +2624,14 @@ impl TaskwarriorTuiApp {
                     self.update_input_for_completion();
                 }
             },
-            AppMode::TaskAnnotate => match input {
+            AppMode::Tasks(TaskMode::TaskAnnotate) => match input {
                 Key::Esc => {
                     if self.show_completion_pane {
                         self.show_completion_pane = false;
                         self.completion_list.unselect();
                     } else {
                         self.command.update("", 0);
-                        self.mode = AppMode::TaskReport;
+                        self.mode = AppMode::Tasks(TaskMode::TaskReport);
                     }
                 }
                 Key::Char('\n') => {
@@ -2572,13 +2645,13 @@ impl TaskwarriorTuiApp {
                     } else {
                         match self.task_annotate() {
                             Ok(_) => {
-                                self.mode = AppMode::TaskReport;
+                                self.mode = AppMode::Tasks(TaskMode::TaskReport);
                                 self.command_history_context.add(self.command.as_str());
                                 self.command.update("", 0);
                                 self.update(true)?;
                             }
                             Err(e) => {
-                                self.mode = AppMode::TaskError;
+                                self.mode = AppMode::Tasks(TaskMode::TaskError);
                                 self.error = e;
                             }
                         }
@@ -2628,33 +2701,33 @@ impl TaskwarriorTuiApp {
                     self.update_input_for_completion();
                 }
             },
-            AppMode::TaskJump => match input {
+            AppMode::Tasks(TaskMode::TaskJump) => match input {
                 Key::Char('\n') => match self.task_report_jump() {
                     Ok(_) => {
-                        self.mode = AppMode::TaskReport;
+                        self.mode = AppMode::Tasks(TaskMode::TaskReport);
                         self.command.update("", 0);
                         self.update(true)?;
                     }
                     Err(e) => {
                         self.command.update("", 0);
-                        self.mode = AppMode::TaskError;
+                        self.mode = AppMode::Tasks(TaskMode::TaskError);
                         self.error = e.to_string();
                     }
                 },
                 Key::Esc => {
                     self.command.update("", 0);
-                    self.mode = AppMode::TaskReport;
+                    self.mode = AppMode::Tasks(TaskMode::TaskReport);
                 }
                 _ => handle_movement(&mut self.command, input),
             },
-            AppMode::TaskAdd => match input {
+            AppMode::Tasks(TaskMode::TaskAdd) => match input {
                 Key::Esc => {
                     if self.show_completion_pane {
                         self.show_completion_pane = false;
                         self.completion_list.unselect();
                     } else {
                         self.command.update("", 0);
-                        self.mode = AppMode::TaskReport;
+                        self.mode = AppMode::Tasks(TaskMode::TaskReport);
                     }
                 }
                 Key::Char('\n') => {
@@ -2668,13 +2741,13 @@ impl TaskwarriorTuiApp {
                     } else {
                         match self.task_add() {
                             Ok(_) => {
-                                self.mode = AppMode::TaskReport;
+                                self.mode = AppMode::Tasks(TaskMode::TaskReport);
                                 self.command_history_context.add(self.command.as_str());
                                 self.command.update("", 0);
                                 self.update(true)?;
                             }
                             Err(e) => {
-                                self.mode = AppMode::TaskError;
+                                self.mode = AppMode::Tasks(TaskMode::TaskError);
                                 self.error = e;
                             }
                         }
@@ -2724,13 +2797,13 @@ impl TaskwarriorTuiApp {
                     self.update_input_for_completion();
                 }
             },
-            AppMode::TaskFilter => match input {
+            AppMode::Tasks(TaskMode::TaskFilter) => match input {
                 Key::Esc => {
                     if self.show_completion_pane {
                         self.show_completion_pane = false;
                         self.completion_list.unselect();
                     } else {
-                        self.mode = AppMode::TaskReport;
+                        self.mode = AppMode::Tasks(TaskMode::TaskReport);
                         self.filter_history_context.add(self.filter.as_str());
                         self.update(true)?;
                     }
@@ -2745,7 +2818,7 @@ impl TaskwarriorTuiApp {
                         self.completion_list.unselect();
                         self.dirty = true;
                     } else {
-                        self.mode = AppMode::TaskReport;
+                        self.mode = AppMode::Tasks(TaskMode::TaskReport);
                         self.filter_history_context.add(self.filter.as_str());
                         self.update(true)?;
                     }
@@ -2803,31 +2876,31 @@ impl TaskwarriorTuiApp {
                     self.dirty = true;
                 }
             },
-            AppMode::TaskDeletePrompt => {
+            AppMode::Tasks(TaskMode::TaskDeletePrompt) => {
                 if input == self.keyconfig.delete || input == Key::Char('\n') {
                     match self.task_delete() {
                         Ok(_) => {
-                            self.mode = AppMode::TaskReport;
+                            self.mode = AppMode::Tasks(TaskMode::TaskReport);
                             self.update(true)?;
                         }
                         Err(e) => {
-                            self.mode = AppMode::TaskError;
+                            self.mode = AppMode::Tasks(TaskMode::TaskError);
                             self.error = e;
                         }
                     }
                 } else if input == self.keyconfig.quit || input == Key::Esc {
                     self.delete.update("", 0);
-                    self.mode = AppMode::TaskReport;
+                    self.mode = AppMode::Tasks(TaskMode::TaskReport);
                 } else {
                     handle_movement(&mut self.command, input);
                 }
             }
-            AppMode::TaskError => self.mode = AppMode::TaskReport,
+            AppMode::Tasks(TaskMode::TaskError) => self.mode = AppMode::Tasks(TaskMode::TaskReport),
             AppMode::Calendar => {
                 if input == self.keyconfig.quit || input == Key::Ctrl('c') {
                     self.should_quit = true;
                 } else if input == self.keyconfig.previous_tab {
-                    self.mode = AppMode::TaskReport;
+                    self.mode = AppMode::Projects(ProjectMode::ProjectReport);
                 } else if input == Key::Up || input == self.keyconfig.up {
                     if self.calendar_year > 0 {
                         self.calendar_year -= 1;
@@ -2851,7 +2924,10 @@ impl TaskwarriorTuiApp {
         self.completion_list.clear();
 
         match self.mode {
-            AppMode::TaskModify | AppMode::TaskAnnotate | AppMode::TaskAdd | AppMode::TaskLog => {
+            AppMode::Tasks(TaskMode::TaskModify)
+            | AppMode::Tasks(TaskMode::TaskAnnotate)
+            | AppMode::Tasks(TaskMode::TaskAdd)
+            | AppMode::Tasks(TaskMode::TaskLog) => {
                 for s in vec![
                     "+".to_string(),
                     "project:".to_string(),
@@ -2867,7 +2943,11 @@ impl TaskwarriorTuiApp {
         }
 
         match self.mode {
-            AppMode::TaskModify | AppMode::TaskFilter | AppMode::TaskAnnotate | AppMode::TaskAdd | AppMode::TaskLog => {
+            AppMode::Tasks(TaskMode::TaskModify)
+            | AppMode::Tasks(TaskMode::TaskFilter)
+            | AppMode::Tasks(TaskMode::TaskAnnotate)
+            | AppMode::Tasks(TaskMode::TaskAdd)
+            | AppMode::Tasks(TaskMode::TaskLog) => {
                 for priority in self.config.uda_priority_values.iter() {
                     let p = format!("priority:{}", &priority);
                     self.completion_list.insert(p);
@@ -2941,7 +3021,7 @@ impl TaskwarriorTuiApp {
             _ => {}
         }
 
-        if self.mode == AppMode::TaskFilter {
+        if self.mode == AppMode::Tasks(TaskMode::TaskFilter) {
             self.completion_list.insert("status:pending".into());
             self.completion_list.insert("status:completed".into());
             self.completion_list.insert("status:deleted".into());
@@ -2952,17 +3032,19 @@ impl TaskwarriorTuiApp {
 
     pub fn update_input_for_completion(&mut self) {
         match self.mode {
-            AppMode::TaskAdd | AppMode::TaskAnnotate | AppMode::TaskLog => {
+            AppMode::Tasks(TaskMode::TaskAdd)
+            | AppMode::Tasks(TaskMode::TaskAnnotate)
+            | AppMode::Tasks(TaskMode::TaskLog) => {
                 let i = get_start_word_under_cursor(self.command.as_str(), self.command.pos());
                 let input = self.command.as_str()[i..self.command.pos()].to_string();
                 self.completion_list.input(input);
             }
-            AppMode::TaskModify => {
+            AppMode::Tasks(TaskMode::TaskModify) => {
                 let i = get_start_word_under_cursor(self.modify.as_str(), self.modify.pos());
                 let input = self.modify.as_str()[i..self.modify.pos()].to_string();
                 self.completion_list.input(input);
             }
-            AppMode::TaskFilter => {
+            AppMode::Tasks(TaskMode::TaskFilter) => {
                 let i = get_start_word_under_cursor(self.filter.as_str(), self.filter.pos());
                 let input = self.filter.as_str()[i..self.filter.pos()].to_string();
                 self.completion_list.input(input);
@@ -3480,7 +3562,7 @@ mod tests {
             let now = Local::now();
             let now = TimeZone::from_utc_datetime(now.offset(), &now.naive_utc());
 
-            app.mode = AppMode::TaskModify;
+            app.mode = AppMode::Tasks(TaskMode::TaskModify);
             match app.task_table_state.mode() {
                 TableMode::SingleSelection => match app.task_current() {
                     Some(t) => {
@@ -3876,7 +3958,7 @@ mod tests {
         let test_case = |expected: &Buffer| {
             let mut app = TaskwarriorTuiApp::new("next").unwrap();
 
-            app.mode = AppMode::TaskHelpPopup;
+            app.mode = AppMode::Tasks(TaskMode::TaskHelpPopup);
             app.task_report_next();
             app.context_next();
             app.update(true).unwrap();
@@ -3922,7 +4004,7 @@ mod tests {
         let test_case = |expected: &Buffer| {
             let mut app = TaskwarriorTuiApp::new("next").unwrap();
 
-            app.mode = AppMode::TaskContextMenu;
+            app.mode = AppMode::Tasks(TaskMode::TaskContextMenu);
             app.task_report_next();
             app.context_next();
             app.update(true).unwrap();
@@ -4005,7 +4087,7 @@ mod tests {
             app.current_selection_uuid = None;
         }
         app.update(true).unwrap();
-        app.mode = AppMode::TaskModify;
+        app.mode = AppMode::Tasks(TaskMode::TaskModify);
         match app.task_current() {
             Some(t) => {
                 let s = format!("{} ", t.description());

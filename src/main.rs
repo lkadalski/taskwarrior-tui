@@ -12,6 +12,7 @@ mod event;
 mod help;
 mod history;
 mod keyconfig;
+mod project;
 mod table;
 mod task_report;
 
@@ -36,10 +37,12 @@ use crossterm::{
 };
 use tui::{backend::CrosstermBackend, Terminal};
 
+use crate::app::TaskMode;
+use crate::keyconfig::KeyConfig;
 use app::{AppMode, TaskwarriorTuiApp};
 
 pub fn setup_terminal() -> Terminal<CrosstermBackend<io::Stdout>> {
-    enable_raw_mode().unwrap();
+    enable_raw_mode().expect("Running not in terminal");
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).unwrap();
     execute!(stdout, Clear(ClearType::All)).unwrap();
@@ -103,7 +106,7 @@ async fn tui_main(_config: &str, report: &str) -> Result<()> {
                     || input == app.keyconfig.shortcut7
                     || input == app.keyconfig.shortcut8
                     || input == app.keyconfig.shortcut9)
-                    && app.mode == AppMode::TaskReport
+                    && app.mode == AppMode::Tasks(TaskMode::TaskReport)
                 {
                     events.leave_tui_mode(&mut terminal);
                 }
@@ -120,8 +123,8 @@ async fn tui_main(_config: &str, report: &str) -> Result<()> {
                     || input == app.keyconfig.shortcut7
                     || input == app.keyconfig.shortcut8
                     || input == app.keyconfig.shortcut9)
-                    && app.mode == AppMode::TaskReport
-                    || app.mode == AppMode::TaskError
+                    && app.mode == AppMode::Tasks(TaskMode::TaskReport)
+                    || app.mode == AppMode::Tasks(TaskMode::TaskError)
                 {
                     events.enter_tui_mode(&mut terminal);
                 }
